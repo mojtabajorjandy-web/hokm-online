@@ -9,6 +9,41 @@ const io = new Server(server, { cors: { origin: "*" } });
 
 app.use(express.static(path.join(__dirname, "public")));
 
+// ---------- Simple admin page for approving VIP requests ----------
+app.get("/admin", (req, res) => {
+  if (req.query.key !== (process.env.ADMIN_KEY || "changeme")) {
+    return res.status(403).send("دسترسی غیرمجاز");
+  }
+  const rowsHtml = pendingVipRequests
+    .map(
+      (r, i) =>
+        `<tr><td>${r.name}</td><td>${r.city || "-"}</td><td>${r.note || "-"}</td><td>${new Date(r.time).toLocaleString("fa-IR")}</td>
+        <td><a href="/admin/approve?key=${req.query.key}&idx=${i}">تأیید VIP</a></td></tr>`
+    )
+    .join("");
+  res.send(`<!DOCTYPE html><html lang="fa" dir="rtl"><head><meta charset="UTF-8"><title>مدیریت VIP</title>
+    <style>body{font-family:Tahoma;padding:20px;background:#1a1108;color:#f6efe1;}table{width:100%;border-collapse:collapse;}
+    td,th{padding:8px;border-bottom:1px solid #444;text-align:right;}a{color:#e0a838;}</style></head>
+    <body><h2>درخواست‌های VIP در انتظار (${pendingVipRequests.length})</h2>
+    <table><tr><th>نام</th><th>شهر</th><th>توضیح</th><th>زمان</th><th></th></tr>${rowsHtml}</table></body></html>`);
+});
+
+app.get("/admin/approve", (req, res) => {
+  if (req.query.key !== (process.env.ADMIN_KEY || "changeme")) {
+    return res.status(403).send("دسترسی غیرمجاز");
+  }
+  const idx = parseInt(req.query.idx);
+  const reqItem = pendingVipRequests[idx];
+  if (reqItem) {
+    if (players[reqItem.id]) players[reqItem.id].vip = true;
+    const s = io.sockets.sockets.get(reqItem.id);
+    if (s) s.emit("vip_approved");
+    pendingVipRequests.splice(idx, 1);
+  }
+  res.redirect("/admin?key=" + req.query.key);
+});
+
+// ---------- Game constants ----------
 const SUITS = [
   { key: "s", symbol: "♠", name: "پیک" },
   { key: "h", symbol: "♥", name: "دل" },
@@ -57,7 +92,26 @@ function isLegalMove(seat, card, hands, trick) {
   return !hasLead;
 }
 
-const rooms = {};
+// ---------- Player directory (in-memory; resets on server restart) ----------
+const players = {}; // socket.id -> { name, city, avatarColor, wins, losses, vip, tournamentWins }
+function colorFromName(name) {
+  let h = 0;
+  for (const c of String(name)) h = (h * 31 + c.charCodeAt(0)) % 360;
+  return `hsl(${h},60%,42%)`;
+}
+function broadcastLobby() {
+  const list = Object.entries(players)
+    .filter(([id]) => {
+      const s = io.sockets.sockets.get(id);
+      return s && !s.data.roomCode;
+    })
+    .map(([id, p]) => ({ id, name: p.name, city: p.city }));
+  io.to("lobby").emit("online_list", list);
+}
+const pendingVipRequests = [];
+
+// ---------- Room management ----------
+const rooms = {}; // code -> room
 
 function makeRoomCode() {
   const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
@@ -68,10 +122,12 @@ function makeRoomCode() {
   return code;
 }
 
-function newRoom(code) {
+function newRoom(code, quickMatch, isTournament) {
   return {
     code,
-    seats: [0, 1, 2, 3].map((i) => ({ id: null, name: `ربات ${i + 1}`, isBot: true })),
+    isQuickMatch: !!quickMatch,
+    isTournament: !!isTournament,
+    seats: [0, 1, 2, 3].map((i) => (quickMatch ? { id: null, name: "", isBot: false } : { id: null, name: `ربات ${i + 1}`, isBot: true })),
     hands: [[], [], [], []],
     trump: null,
     hakem: 0,
@@ -81,7 +137,9 @@ function newRoom(code) {
     roundScore: { A: 0, B: 0 },
     round: 0,
     phase: "waiting",
-    message: "منتظر بازیکنان...",
+    message: quickMatch ? "در حال پیدا کردن حریف..." : "منتظر بازیکنان...",
+    chat: [],
+    fillTimer: null,
   };
 }
 
@@ -97,6 +155,10 @@ function emitState(room) {
         isBot: s.isBot,
         connected: !!s.id,
         handCount: room.hands[i] ? room.hands[i].length : 0,
+        city: s.city || "",
+        avatarColor: s.avatarColor || "#7a6650",
+        wins: s.id && players[s.id] ? players[s.id].wins : 0,
+        losses: s.id && players[s.id] ? players[s.id].losses : 0,
       })),
       hand: room.hands[mySeat] || [],
       trump: room.trump,
@@ -108,6 +170,8 @@ function emitState(room) {
       round: room.round,
       phase: room.phase,
       message: room.message,
+      chat: room.chat,
+      isQuickMatch: room.isQuickMatch,
     };
     io.to(seat.id).emit("state", payload);
   }
@@ -164,6 +228,15 @@ function finishRound(room) {
   if (room.roundScore[winnerTeam] >= 7) {
     room.phase = "game-end";
     room.message = `تیم ${winnerTeam === "A" ? "۱ (بازیکنان ۱و۳)" : "۲ (بازیکنان ۲و۴)"} برنده‌ی بازی شد! 🎉`;
+    room.seats.forEach((s, i) => {
+      if (!s.id || !players[s.id]) return;
+      if (teamOf(i) === winnerTeam) {
+        players[s.id].wins += 1;
+        if (room.isTournament) players[s.id].tournamentWins += 1;
+      } else {
+        players[s.id].losses += 1;
+      }
+    });
   } else {
     room.phase = "round-end";
     room.message = `تیم ${winnerTeam === "A" ? "۱" : "۲"} این دست را برد (${room.tricksWon.A} بر ${room.tricksWon.B})`;
@@ -248,7 +321,29 @@ function allSeatsReady(room) {
   return room.seats.every((s) => s.id || s.isBot);
 }
 
+// ---------- Quick match ----------
+let quickMatchRoomCode = null;
+let tournamentRoomCode = null;
+
+function scheduleQuickFill(room) {
+  if (room.fillTimer) clearTimeout(room.fillTimer);
+  room.fillTimer = setTimeout(() => {
+    if (room.phase !== "waiting") return;
+    room.seats.forEach((s, i) => {
+      if (!s.id) room.seats[i] = { id: null, name: `ربات ${i + 1}`, isBot: true };
+    });
+    if (quickMatchRoomCode === room.code) quickMatchRoomCode = null;
+    room.roundScore = { A: 0, B: 0 };
+    room.hakem = 0;
+    room.round = 0;
+    startRound(room);
+  }, 12000);
+}
+
+// ---------- Socket handlers ----------
 io.on("connection", (socket) => {
+  let joinedCode = null;
+
   socket.on("create_room", ({ name }) => {
     const code = makeRoomCode();
     rooms[code] = newRoom(code);
@@ -270,12 +365,163 @@ io.on("connection", (socket) => {
       socket.emit("error_msg", "این اتاق پر است");
       return;
     }
-    room.seats[emptyIdx] = { id: socket.id, name: name || `بازیکن ${emptyIdx + 1}`, isBot: false };
+    const profile = players[socket.id] || {};
+    const finalName = name || profile.name || `بازیکن ${emptyIdx + 1}`;
+    room.seats[emptyIdx] = {
+      id: socket.id,
+      name: finalName,
+      isBot: false,
+      city: profile.city || "",
+      avatarColor: profile.avatarColor || colorFromName(finalName),
+    };
+    joinedCode = room.code;
     socket.join(room.code);
+    socket.leave("lobby");
     socket.data.roomCode = room.code;
     room.message = room.phase === "waiting" ? "منتظر بازیکنان..." : room.message;
     emitState(room);
+    broadcastLobby();
   }
+
+  socket.on("list_online", () => {
+    broadcastLobby();
+  });
+
+  socket.on("set_profile", ({ name, city }) => {
+    const cleanName = String(name || "بازیکن").slice(0, 16).trim() || "بازیکن";
+    const cleanCity = String(city || "").slice(0, 20).trim();
+    players[socket.id] = {
+      name: cleanName,
+      city: cleanCity,
+      avatarColor: colorFromName(cleanName),
+      wins: (players[socket.id] && players[socket.id].wins) || 0,
+      losses: (players[socket.id] && players[socket.id].losses) || 0,
+      vip: (players[socket.id] && players[socket.id].vip) || false,
+      tournamentWins: (players[socket.id] && players[socket.id].tournamentWins) || 0,
+    };
+    socket.join("lobby");
+    socket.emit("profile_ack", players[socket.id]);
+    broadcastLobby();
+  });
+
+  socket.on("invite_player", ({ targetId }) => {
+    const me = players[socket.id];
+    if (!me) return;
+    const targetSocket = io.sockets.sockets.get(targetId);
+    if (!targetSocket || !players[targetId]) {
+      socket.emit("error_msg", "این بازیکن دیگر آنلاین نیست");
+      return;
+    }
+    const code = makeRoomCode();
+    const room = newRoom(code, false, false);
+    rooms[code] = room;
+    joinRoomSeat(room, socket, me.name);
+    targetSocket.emit("invite_received", { code, fromName: me.name });
+  });
+
+  socket.on("accept_invite", ({ code }) => {
+    const room = rooms[(code || "").toUpperCase()];
+    if (!room) {
+      socket.emit("error_msg", "این دعوت دیگر معتبر نیست");
+      return;
+    }
+    const me = players[socket.id];
+    joinRoomSeat(room, socket, me ? me.name : undefined);
+  });
+
+  socket.on("get_payment_info", () => {
+    socket.emit("payment_info", {
+      cardNumber: process.env.BANK_CARD_NUMBER || "---- ---- ---- ----",
+      cardName: process.env.BANK_CARD_NAME || "Mojtaba Jorjandy",
+      usdt: process.env.USDT_WALLET_ADDRESS || "",
+    });
+  });
+
+  socket.on("vip_purchase_request", ({ note }) => {
+    const me = players[socket.id];
+    if (!me) return;
+    pendingVipRequests.push({ id: socket.id, name: me.name, city: me.city, note: String(note || "").slice(0, 200), time: Date.now() });
+    console.log(`VIP REQUEST — name: ${me.name}, socket: ${socket.id}, note: ${note}`);
+    socket.emit("vip_request_ack");
+  });
+
+  socket.on("get_leaderboard", () => {
+    const top = Object.values(players)
+      .filter((p) => p.tournamentWins > 0)
+      .sort((a, b) => b.tournamentWins - a.tournamentWins)
+      .slice(0, 10)
+      .map((p) => ({ name: p.name, city: p.city, wins: p.tournamentWins }));
+    socket.emit("leaderboard", top);
+  });
+
+  socket.on("join_tournament", () => {
+    const me = players[socket.id];
+    if (!me) return;
+    if (!me.vip) {
+      socket.emit("error_msg", "برای ورود به تورنومنت باید اشتراک VIP بخری");
+      return;
+    }
+    let room = tournamentRoomCode ? rooms[tournamentRoomCode] : null;
+    const hasSlot = room && room.phase === "waiting" && room.seats.some((s) => !s.id);
+    if (!hasSlot) {
+      const code = makeRoomCode();
+      room = newRoom(code, true, true);
+      rooms[code] = room;
+      tournamentRoomCode = code;
+    }
+    joinRoomSeat(room, socket, me.name);
+    const filled = room.seats.filter((s) => s.id).length;
+    if (filled >= 4) {
+      if (room.fillTimer) clearTimeout(room.fillTimer);
+      if (tournamentRoomCode === room.code) tournamentRoomCode = null;
+      room.roundScore = { A: 0, B: 0 };
+      room.hakem = 0;
+      room.round = 0;
+      startRound(room);
+    } else {
+      room.message = `در حال پیدا کردن حریف تورنومنت... (${filled}/4)`;
+      scheduleQuickFill(room);
+      emitState(room);
+    }
+  });
+
+  socket.on("quick_match", ({ name }) => {
+    let room = quickMatchRoomCode ? rooms[quickMatchRoomCode] : null;
+    const hasSlot = room && room.phase === "waiting" && room.seats.some((s) => !s.id);
+    if (!hasSlot) {
+      const code = makeRoomCode();
+      room = newRoom(code, true);
+      rooms[code] = room;
+      quickMatchRoomCode = code;
+    }
+    joinRoomSeat(room, socket, name);
+    const filled = room.seats.filter((s) => s.id).length;
+    if (filled >= 4) {
+      if (room.fillTimer) clearTimeout(room.fillTimer);
+      if (quickMatchRoomCode === room.code) quickMatchRoomCode = null;
+      room.roundScore = { A: 0, B: 0 };
+      room.hakem = 0;
+      room.round = 0;
+      startRound(room);
+    } else {
+      room.message = `در حال پیدا کردن حریف... (${filled}/4)`;
+      scheduleQuickFill(room);
+      emitState(room);
+    }
+  });
+
+  socket.on("send_chat", ({ text }) => {
+    const room = rooms[socket.data.roomCode];
+    if (!room) return;
+    const seat = room.seats.findIndex((s) => s.id === socket.id);
+    if (seat === -1) return;
+    const clean = String(text || "").slice(0, 300).trim();
+    if (!clean) return;
+    const msg = { seat, name: room.seats[seat].name, text: clean, time: Date.now() };
+    room.chat.push(msg);
+    if (room.chat.length > 100) room.chat.shift();
+    io.to(room.code).emit("chat_message", msg);
+  });
 
   socket.on("fill_bots", () => {
     const room = rooms[socket.data.roomCode];
@@ -290,6 +536,8 @@ io.on("connection", (socket) => {
     const room = rooms[socket.data.roomCode];
     if (!room || room.phase !== "waiting") return;
     if (!allSeatsReady(room)) return;
+    if (room.fillTimer) clearTimeout(room.fillTimer);
+    if (quickMatchRoomCode === room.code) quickMatchRoomCode = null;
     room.roundScore = { A: 0, B: 0 };
     room.hakem = 0;
     room.round = 0;
@@ -330,6 +578,8 @@ io.on("connection", (socket) => {
   });
 
   socket.on("disconnect", () => {
+    delete players[socket.id];
+    broadcastLobby();
     const room = rooms[socket.data.roomCode];
     if (!room) return;
     const seatIdx = room.seats.findIndex((s) => s.id === socket.id);
